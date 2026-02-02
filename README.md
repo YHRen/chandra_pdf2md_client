@@ -69,35 +69,35 @@ MIN_IMAGE_DIM = 1536         # Minimum dimension for images
 BBOX_SCALE = 1024            # Bounding box normalization scale
 ```
 
-Update the server connection if needed:
+The server connection can be configured via the `--server-url` CLI argument:
 
-```python
-client = OpenAI(
-    base_url="http://localhost:8001/v1",  # Change if using different host/port
-    api_key="chandra",
-)
+```bash
+# Use a remote or custom server
+python chandra_client.py document.pdf --server-url http://remote-server:8001/v1
 ```
 
 ## Usage
 
-### Basic Usage
-
-```python
-from pathlib import Path
-from chandra_client import load_file, encode_image, parse_markdown, extract_images
-
-# Load PDF
-images = load_file("document.pdf", {})
-
-# Process each page (requires vLLM client setup)
-# See main() function for complete example
-```
-
 ### Command Line
 
 ```bash
-# Edit the pdf_file_path in main() function
-python chandra_client.py
+# Basic usage - process entire PDF
+python chandra_client.py document.pdf
+
+# Process specific pages (1-based indexing)
+python chandra_client.py document.pdf --page-range "1,3,5-10"
+
+# Custom output directory
+python chandra_client.py document.pdf --output-dir my_output
+
+# Use remote Chandra server
+python chandra_client.py document.pdf --server-url http://remote-server:8001/v1
+
+# Combine options
+python chandra_client.py document.pdf --page-range "1-5" --output-dir results
+
+# See all options
+python chandra_client.py --help
 ```
 
 The script will:
@@ -107,12 +107,20 @@ The script will:
 4. Generate Markdown and HTML files
 5. Extract and save images to the output directory
 
-### Page Range Selection
+### Python API
 
 ```python
+from pathlib import Path
+from chandra_client import load_file, encode_image, parse_markdown, extract_images
+
+# Load PDF
+images = load_file("document.pdf", {})
+
 # Process specific pages (1-based indexing)
 config = {"page_range": "1,3,5-10"}
 images = load_file("document.pdf", config)
+
+# See main() function for complete example
 ```
 
 ## Output Structure
@@ -295,6 +303,268 @@ if __name__ == "__main__":
 This code is Apache 2.0
 
 
+## MCP Server
+
+This project also includes an **MCP (Model Context Protocol) server** that exposes Chandra's PDF conversion capabilities through a standardized interface. The MCP server can be used with Claude Desktop or any other MCP-compatible client.
+
+### What is MCP?
+
+MCP is a protocol that allows AI assistants like Claude to interact with external tools and services. The Chandra MCP server exposes four tools:
+
+1. **`convert_pdf`** - Convert entire PDFs to Markdown/HTML
+2. **`convert_page_to_markdown`** - Convert a single page (returns content inline)
+3. **`extract_pdf_metadata`** - Get PDF metadata without OCR
+4. **`configure_server`** - Configure Chandra server connection
+
+### Installation
+
+```bash
+# Install dependencies including MCP SDK
+uv sync
+```
+
+### Configuration
+
+#### Option 1: Install from GitHub with uvx (Recommended)
+
+Create a `.mcp.json` file in your project directory:
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/YHRen/chandra_pdf2md_client",
+        "chandra-mcp"
+      ],
+      "env": {
+        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
+        "CHANDRA_API_KEY": "chandra"
+      }
+    }
+  }
+}
+```
+
+**Or** add to your user config at `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/YHRen/chandra_pdf2md_client",
+        "chandra-mcp"
+      ],
+      "env": {
+        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
+        "CHANDRA_API_KEY": "chandra"
+      }
+    }
+  }
+}
+```
+
+This will automatically download and run the MCP server from GitHub without cloning the repository.
+
+#### Option 2: Local Development
+
+If you have the repository cloned locally, create a `.mcp.json` file:
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/path/to/chandra_pdf2md_client",
+        "chandra-mcp"
+      ],
+      "env": {
+        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
+        "CHANDRA_API_KEY": "chandra"
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/chandra_pdf2md_client` with the actual path to this repository.
+
+#### Option 3: Claude Desktop App
+
+Add this to your Claude Desktop configuration file:
+
+**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/YHRen/chandra_pdf2md_client",
+        "chandra-mcp"
+      ],
+      "env": {
+        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
+        "CHANDRA_API_KEY": "chandra"
+      }
+    }
+  }
+}
+```
+
+### Environment Variables
+
+Configure the MCP server using environment variables:
+
+```bash
+# Server configuration
+export CHANDRA_SERVER_URL="http://localhost:8001/v1"
+export CHANDRA_API_KEY="chandra"
+export CHANDRA_MAX_TOKENS="12384"
+export CHANDRA_TEMPERATURE="0.0"
+export CHANDRA_TOP_P="0.1"
+
+# Output configuration
+export CHANDRA_OUTPUT_DIR="./output"
+export CHANDRA_IMAGE_FORMAT="webp"
+
+# Image processing
+export CHANDRA_IMAGE_DPI="192"
+export CHANDRA_MIN_PDF_IMAGE_DIM="1024"
+export CHANDRA_MIN_IMAGE_DIM="1536"
+```
+
+### Using the MCP Server
+
+Once configured in Claude Desktop, you can use natural language to convert PDFs:
+
+```
+"Convert document.pdf to markdown and save it to ./output"
+```
+
+Claude will automatically use the appropriate MCP tool to:
+1. Connect to your Chandra server
+2. Process the PDF pages
+3. Generate Markdown/HTML output
+4. Extract images
+
+### Testing the MCP Server
+
+#### Test from GitHub
+
+```bash
+# Run directly from GitHub
+uvx --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp
+```
+
+#### Test locally
+
+```bash
+# Install dependencies
+uv sync
+
+# Run the server (it will listen on stdio)
+uvx --from . chandra-mcp
+```
+
+The server communicates via stdin/stdout using the MCP protocol. Press Ctrl+C to stop.
+
+### MCP Tools Reference
+
+#### convert_pdf
+
+Convert a PDF to Markdown and/or HTML.
+
+**Parameters:**
+- `file_path` (required): Path to PDF or image file
+- `output_dir` (default: "./output"): Output directory
+- `page_range` (optional): e.g., "1,3,5-10"
+- `include_headers_footers` (default: false): Include headers/footers
+- `include_images` (default: true): Include images
+- `output_format` (default: "both"): "markdown", "html", or "both"
+- `image_dpi` (default: 192): DPI for rendering
+- `server_url` (optional): Override server URL
+
+**Returns:** JSON with paths to output files, page count, and image count
+
+#### convert_page_to_markdown
+
+Convert a single page, returning content inline.
+
+**Parameters:**
+- `file_path` (required): Path to PDF or image file
+- `page_number` (default: 1): Page to convert (1-based)
+- `include_headers_footers` (default: false): Include headers/footers
+- `include_images` (default: true): Include images
+- `return_format` (default: "markdown"): "markdown", "html", or "both"
+- `server_url` (optional): Override server URL
+
+**Returns:** JSON with markdown/html content and base64-encoded images
+
+#### extract_pdf_metadata
+
+Get PDF metadata without OCR.
+
+**Parameters:**
+- `file_path` (required): Path to PDF or image file
+
+**Returns:** JSON with page count, file type, size, and estimated processing time
+
+#### configure_server
+
+Configure Chandra server connection.
+
+**Parameters:**
+- `server_url` (required): Chandra server URL
+- `api_key` (default: "chandra"): API key
+- `max_tokens` (default: 12384): Max tokens
+- `temperature` (default: 0.0): Temperature
+- `top_p` (default: 0.1): Top-p
+- `timeout` (default: 300): Timeout in seconds
+
+**Returns:** JSON with connection status
+
+### Troubleshooting MCP Server
+
+**Server not found in Claude Desktop:**
+- Check that the path in `claude_desktop_config.json` is correct
+- Verify `uv` is in your PATH
+- Restart Claude Desktop after configuration changes
+
+**Connection errors:**
+- Ensure Chandra vLLM server is running at the configured URL
+- Test with: `curl http://localhost:8001/v1/models`
+- Check environment variables are set correctly
+
+**Permission errors:**
+- Ensure output directory is writable
+- Check file paths are accessible to the MCP server process
+
+## Standalone Client
+
+The standalone Python client is available in `chandra_client.py`. To use it:
+
+```bash
+# Basic usage
+python chandra_client.py document.pdf
+
+# With options
+python chandra_client.py document.pdf --page-range "1-5" --output-dir results
+
+# See all options
+python chandra_client.py --help
+```
+
 ## Acknowledgments
 
 Built with:
@@ -303,3 +573,4 @@ Built with:
 - [OpenAI Python SDK](https://github.com/openai/openai-python) for API client
 - [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) for HTML parsing
 - [markdownify](https://github.com/matthewwithanm/python-markdownify) for Markdown conversion
+- [MCP](https://modelcontextprotocol.io) for tool integration

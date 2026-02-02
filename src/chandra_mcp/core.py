@@ -1,11 +1,12 @@
+"""Core processing logic for PDF to Markdown conversion using Chandra."""
+
 import io
 import base64
 import json
 import hashlib
 import re
-import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Optional
 from PIL import Image
 from openai import OpenAI
 import filetype
@@ -15,11 +16,8 @@ from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter, re_whitespace
 import six
 
-# Configuration
-IMAGE_DPI: int = 192
-MIN_PDF_IMAGE_DIM: int = 1024
-MIN_IMAGE_DIM: int = 1536
-BBOX_SCALE: int = 1024
+from .config import ChandraConfig
+
 
 # OCR Layout Prompt
 OCR_LAYOUT_PROMPT = """
@@ -56,22 +54,54 @@ Guidelines:
 """.strip()
 
 
-def flatten(page, flag=pdfium_c.FLAT_NORMALDISPLAY):
+def flatten(page, flag=pdfium_c.FLAT_NORMALDISPLAY) -> None:
+    """
+    Flatten annotations and form fields on a PDF page.
+
+    Args:
+        page: pypdfium2 page object
+        flag: Flattening flag (default: FLAT_NORMALDISPLAY)
+    """
     rc = pdfium_c.FPDFPage_Flatten(page, flag)
     if rc == pdfium_c.FLATTEN_FAIL:
         print(f"Failed to flatten annotations / form fields on page {page}.")
 
 
-def load_image(filepath: str):
+def load_image(filepath: str, config: ChandraConfig) -> Image.Image:
+    """
+    Load an image file and upscale if needed.
+
+    Args:
+        filepath: Path to image file
+        config: Configuration with min_image_dim setting
+
+    Returns:
+        PIL Image object
+    """
     image = Image.open(filepath).convert("RGB")
-    if image.width < MIN_IMAGE_DIM or image.height < MIN_IMAGE_DIM:
-        scale = MIN_IMAGE_DIM / min(image.width, image.height)
+    if image.width < config.min_image_dim or image.height < config.min_image_dim:
+        scale = config.min_image_dim / min(image.width, image.height)
         new_size = (int(image.width * scale), int(image.height * scale))
         image = image.resize(new_size, Image.Resampling.LANCZOS)
     return image
 
 
-def load_pdf_images(filepath: str, page_range: List[int]):
+def load_pdf_images(
+    filepath: str,
+    page_range: Optional[List[int]],
+    config: ChandraConfig
+) -> List[Image.Image]:
+    """
+    Load PDF pages as high-resolution images.
+
+    Args:
+        filepath: Path to PDF file
+        page_range: List of 0-based page indices to load (None for all pages)
+        config: Configuration with image rendering settings
+
+    Returns:
+        List of PIL Image objects
+    """
     doc = pdfium.PdfDocument(filepath)
     doc.init_forms()
 
@@ -80,8 +110,8 @@ def load_pdf_images(filepath: str, page_range: List[int]):
         if not page_range or page in page_range:
             page_obj = doc[page]
             min_page_dim = min(page_obj.get_width(), page_obj.get_height())
-            scale_dpi = (MIN_PDF_IMAGE_DIM / min_page_dim) * 72
-            scale_dpi = max(scale_dpi, IMAGE_DPI)
+            scale_dpi = (config.min_pdf_image_dim / min_page_dim) * 72
+            scale_dpi = max(scale_dpi, config.image_dpi)
             page_obj = doc[page]
             flatten(page_obj)
             page_obj = doc[page]
@@ -94,41 +124,86 @@ def load_pdf_images(filepath: str, page_range: List[int]):
 
 
 def parse_range_str(range_str: str) -> List[int]:
+    """
+    Parse a page range string into a list of 0-based page indices.
+
+    Args:
+        range_str: Range string like "1,3,5-10"
+
+    Returns:
+        Deduplicated, sorted list of 0-based page indices
+    """
     range_lst = range_str.split(",")
     page_lst = []
     for i in range_lst:
         if "-" in i:
             start, end = i.split("-")
-            page_lst += list(range(int(start), int(end) + 1))
+            # Convert from 1-based to 0-based
+            page_lst += list(range(int(start) - 1, int(end)))
         else:
-            page_lst.append(int(i))
+            # Convert from 1-based to 0-based
+            page_lst.append(int(i) - 1)
     # Deduplicate page numbers and sort in order
     page_lst = sorted(list(set(page_lst)))
     return page_lst
 
 
-def load_file(filepath: str, config: dict):
+def load_file(filepath: str, config: dict, chandra_config: ChandraConfig) -> List[Image.Image]:
+    """
+    Load a PDF or image file.
+
+    Args:
+        filepath: Path to file
+        config: Dictionary with optional 'page_range' key
+        chandra_config: Chandra configuration
+
+    Returns:
+        List of PIL Image objects
+    """
     page_range = config.get("page_range")
     if page_range:
         page_range = parse_range_str(page_range)
 
     input_type = filetype.guess(filepath)
     if input_type and input_type.extension == "pdf":
-        images = load_pdf_images(filepath, page_range)
+        images = load_pdf_images(filepath, page_range, chandra_config)
     else:
-        images = [load_image(filepath)]
+        images = [load_image(filepath, chandra_config)]
     return images
 
 
-def encode_image(image: Image.Image):
+def encode_image(image: Image.Image) -> str:
+    """
+    Encode a PIL Image as base64 PNG.
+
+    Args:
+        image: PIL Image object
+
+    Returns:
+        Base64-encoded PNG string
+    """
     buffered = io.BytesIO()
     image.save(buffered, format="png")
     img_byte = buffered.getvalue()
     return base64.b64encode(img_byte).decode("utf-8")
 
 
-def parse_html(html: str, include_headers_footers: bool = False, include_images: bool = True):
-    """Parse and filter HTML based on data-label attributes."""
+def parse_html(
+    html: str,
+    include_headers_footers: bool = False,
+    include_images: bool = True
+) -> str:
+    """
+    Parse and filter HTML based on data-label attributes.
+
+    Args:
+        html: HTML string from OCR
+        include_headers_footers: Whether to include page headers/footers
+        include_images: Whether to include images and figures
+
+    Returns:
+        Filtered HTML string
+    """
     soup = BeautifulSoup(html, "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     out_html = ""
@@ -230,8 +305,22 @@ class Markdownify(MarkdownConverter):
         return text
 
 
-def parse_markdown(html: str, include_headers_footers: bool = False, include_images: bool = True):
-    """Convert HTML to markdown with custom handling for math and tables."""
+def parse_markdown(
+    html: str,
+    include_headers_footers: bool = False,
+    include_images: bool = True
+) -> str:
+    """
+    Convert HTML to markdown with custom handling for math and tables.
+
+    Args:
+        html: HTML string from OCR
+        include_headers_footers: Whether to include page headers/footers
+        include_images: Whether to include images and figures
+
+    Returns:
+        Markdown string
+    """
     html = parse_html(html, include_headers_footers, include_images)
 
     md_cls = Markdownify(
@@ -254,8 +343,22 @@ def parse_markdown(html: str, include_headers_footers: bool = False, include_ima
     return markdown.strip()
 
 
-def parse_chunks(html: str, image: Image.Image, bbox_scale: int = BBOX_SCALE):
-    """Extract layout blocks with bounding boxes from HTML."""
+def parse_chunks(
+    html: str,
+    image: Image.Image,
+    bbox_scale: int
+) -> List[Dict]:
+    """
+    Extract layout blocks with bounding boxes from HTML.
+
+    Args:
+        html: HTML string with layout blocks
+        image: Original page image
+        bbox_scale: Normalization scale for bounding boxes (typically 1024)
+
+    Returns:
+        List of chunks with bbox, label, and content
+    """
     soup = BeautifulSoup(html, "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     width, height = image.size
@@ -302,14 +405,33 @@ def parse_chunks(html: str, image: Image.Image, bbox_scale: int = BBOX_SCALE):
     return chunks
 
 
-def get_image_name(html: str, div_idx: int):
-    """Generate unique image filename based on HTML hash and index."""
+def get_image_name(html: str, div_idx: int) -> str:
+    """
+    Generate unique image filename based on HTML hash and index.
+
+    Args:
+        html: HTML string
+        div_idx: 1-based div index
+
+    Returns:
+        Image filename
+    """
     html_hash = hashlib.md5(html.encode("utf-8")).hexdigest()
     return f"{html_hash}_{div_idx}_img.webp"
 
 
-def extract_images(html: str, chunks: list, image: Image.Image):
-    """Extract and crop images from layout blocks using bounding boxes."""
+def extract_images(html: str, chunks: list, image: Image.Image) -> Dict[str, Image.Image]:
+    """
+    Extract and crop images from layout blocks using bounding boxes.
+
+    Args:
+        html: HTML string
+        chunks: List of chunks with bboxes
+        image: Original page image
+
+    Returns:
+        Dictionary mapping image names to PIL Images
+    """
     images = {}
     div_idx = 0
     for chunk in chunks:
@@ -326,127 +448,71 @@ def extract_images(html: str, chunks: list, image: Image.Image):
     return images
 
 
-def main():
-    # Parse CLI arguments
-    parser = argparse.ArgumentParser(
-        description="Convert PDF documents to structured Markdown using Chandra model"
-    )
-    parser.add_argument(
-        "pdf_file",
-        type=str,
-        help="Path to the PDF file to process"
-    )
-    parser.add_argument(
-        "--page-range",
-        type=str,
-        default=None,
-        help='Page range to process (e.g., "1,3,5-10"). If not specified, processes all pages.'
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="output",
-        help="Directory to save output files (default: output)"
-    )
-    parser.add_argument(
-        "--server-url",
-        type=str,
-        default="http://localhost:8001/v1",
-        help="Chandra vLLM server URL (default: http://localhost:8001/v1)"
+def create_openai_client(config: ChandraConfig) -> OpenAI:
+    """
+    Create an OpenAI client configured for Chandra vLLM server.
+
+    Args:
+        config: Chandra configuration
+
+    Returns:
+        OpenAI client instance
+    """
+    return OpenAI(
+        base_url=config.server_url,
+        api_key=config.api_key,
+        timeout=config.timeout,
     )
 
-    args = parser.parse_args()
 
-    # Initialize vLLM client
-    client = OpenAI(
-        base_url=args.server_url,
-        api_key="chandra",
-    )
+def save_outputs(
+    file_path: str,
+    output_dir: Path,
+    all_markdown: List[str],
+    all_html: List[str],
+    all_images: Dict[str, Image.Image],
+    output_format: str,
+    image_format: str = "webp"
+) -> Dict[str, str]:
+    """
+    Save processed outputs to disk.
 
-    # Prepare config
-    config = {}
-    if args.page_range:
-        config["page_range"] = args.page_range
+    Args:
+        file_path: Original file path (for naming)
+        output_dir: Output directory path
+        all_markdown: List of markdown strings per page
+        all_html: List of HTML strings per page
+        all_images: Dictionary of extracted images
+        output_format: "markdown", "html", or "both"
+        image_format: Image format (default: "webp")
 
-    # Load PDF or image
-    print(f"Loading file: {args.pdf_file}")
-    images = load_file(args.pdf_file, config)
-    print(f"Loaded {len(images)} page(s)")
-
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-
-    all_markdown = []
-    all_html = []
-    all_images = {}
-
-    # Process each page
-    for page_num, img in enumerate(images):
-        print(f"\nProcessing page {page_num + 1}/{len(images)}...")
-
-        # Encode image for API
-        encoded_img = encode_image(img)
-
-        # Make inference request
-        chat_completion = client.chat.completions.create(
-            model="chandra",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": OCR_LAYOUT_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{encoded_img}"}
-                    },
-                ],
-            }],
-            max_tokens=12384,
-            temperature=0,
-            top_p=0.1,
-            stream=False,
-        )
-
-        html_output = chat_completion.choices[0].message.content
-
-        # Process the HTML output
-        markdown = parse_markdown(html_output, include_headers_footers=False, include_images=True)
-        html = parse_html(html_output, include_headers_footers=False, include_images=True)
-        chunks = parse_chunks(html_output, img, bbox_scale=BBOX_SCALE)
-        page_images = extract_images(html_output, chunks, img)
-
-        # Collect results
-        all_markdown.append(markdown)
-        all_html.append(html)
-        all_images.update(page_images)
-
-        print(f"  Extracted {len(page_images)} images from page {page_num + 1}")
-        print(f"  Generated {len(markdown)} characters of markdown")
+    Returns:
+        Dictionary with paths to saved files
+    """
+    pdf_name = Path(file_path).stem
+    output_paths = {}
 
     # Save markdown file
-    pdf_name = Path(args.pdf_file).stem
-    markdown_path = output_dir / f"{pdf_name}.md"
-    with open(markdown_path, "w", encoding="utf-8") as f:
-        f.write("\n\n---\n\n".join(all_markdown))
+    if output_format in ["markdown", "both"] and all_markdown:
+        markdown_path = output_dir / f"{pdf_name}.md"
+        with open(markdown_path, "w", encoding="utf-8") as f:
+            f.write("\n\n---\n\n".join(all_markdown))
+        output_paths["markdown"] = str(markdown_path)
 
     # Save HTML file
-    html_path = output_dir / f"{pdf_name}.html"
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write("\n\n<hr>\n\n".join(all_html))
+    if output_format in ["html", "both"] and all_html:
+        html_path = output_dir / f"{pdf_name}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("\n\n<hr>\n\n".join(all_html))
+        output_paths["html"] = str(html_path)
 
     # Save extracted images
-    images_dir = output_dir / "images"
-    images_dir.mkdir(exist_ok=True)
-    for img_name, pil_image in all_images.items():
-        img_path = images_dir / img_name
-        pil_image.save(img_path)
+    if all_images:
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        for img_name, pil_image in all_images.items():
+            img_path = images_dir / img_name
+            pil_image.save(img_path)
+        output_paths["images_dir"] = str(images_dir)
 
-    print(f"\n{'='*60}")
-    print(f"✓ Done! Saved markdown to {markdown_path}")
-    print(f"✓ Saved HTML to {html_path}")
-    print(f"✓ Saved {len(all_images)} images to {images_dir}")
-    print(f"{'='*60}")
-
-
-if __name__ == "__main__":
-    main()
+    return output_paths
