@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --python ${{ matrix.python-version }} --group dev
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: MCP server smoke test
+        run: |
+          uv run chandra-mcp --version
+          uv run python - <<'PY'
+          import asyncio
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+          async def main():
+              params = StdioServerParameters(command="uv", args=["run", "chandra-mcp", "--port", "9999"])
+              async with stdio_client(params) as (r, w):
+                  async with ClientSession(r, w) as s:
+                      await s.initialize()
+                      names = {t.name for t in (await s.list_tools()).tools}
+                      assert {"convert_pdf", "detect_missing_figures", "recover_figures",
+                              "inject_figures", "render_pdf_page"} <= names, names
+                      assert {p.name for p in (await s.list_prompts()).prompts} == {"hybrid_parse"}
+              print("MCP smoke test ok:", sorted(names))
+          asyncio.run(main())
+          PY

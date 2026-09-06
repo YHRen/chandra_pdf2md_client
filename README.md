@@ -1,31 +1,54 @@
-# Chandra PDF to Markdown Client
+# Chandra PDF to Markdown Client for Academic Papers
 
-A Python client for converting PDF documents to structured Markdown using OCR with layout detection. This client leverages the [Chandra vision-language model](https://github.com/datalab-to/chandra) to intelligently parse document layouts, extract content, and preserve formatting including tables, equations, figures, and more.
+A Python client and MCP server around the [Chandra](https://github.com/datalab-to/chandra) OCR
+vision-language model, tuned for **scientific papers**. It converts a paper PDF into clean Markdown
+and HTML with math, tables and figures, and it fixes the one systematic gap we hit when parsing
+papers with Chandra: **vector-based figures are skipped**.
 
-## About Chandra
+## The problem this solves
 
-This client is designed to work with **Chandra**, a specialized vision-language model optimized for document understanding and OCR tasks. Chandra excels at:
+Chandra crops the figures it recognises as `Image` or `Figure` layout blocks. Many figures in
+papers are not raster images but vector drawings (workflow diagrams, plots exported from
+matplotlib or TikZ, boxed text panels). Chandra frequently reads those as ordinary text blocks:
+the caption ("Figure 1. ...") survives in the Markdown, but the figure itself is gone, and often
+the box's inner text is dumped as paragraphs. For a paper with five figures we saw four disappear
+this way.
 
-- Layout analysis and block segmentation
-- Multi-modal content extraction (text, tables, equations, figures)
-- High-quality OCR with formatting preservation
-- Structured HTML output with semantic labeling
+This client adds a **hybrid recovery step** that does not depend on the vision model:
 
-**Learn more**: [Chandra Model Repository](https://github.com/datalab-to/chandra)
+1. `detect_missing_figures` scans the Markdown for captions that have no image next to them.
+2. `recover_figures` finds each caption in the PDF text layer, gathers the vector graphics objects
+   sitting above it in the same column, and crops that region from a rendered page (with a
+   fixed-height fallback and manual crop-box override).
+3. `inject_figures` places the recovered image above its caption in the Markdown and HTML.
+
+The tools are deterministic and inspectable. The judgement calls (is this candidate really a
+figure, does the crop look right) are left to whoever drives them: a person, or an AI agent
+through the bundled MCP server and skill. No LLM is called inside the client and no API keys are
+needed.
+
+## What is Chandra
+
+Chandra is a specialised vision-language model for document OCR and layout analysis. It produces
+structured HTML with semantic block labels (text, section headers, tables, equations, figures,
+captions, footnotes), which this client turns into Markdown and HTML. See the
+[Chandra repository](https://github.com/datalab-to/chandra) for the model and the vLLM server
+setup.
 
 ## Features
 
-- **Intelligent Layout Detection**: Recognizes 13+ different layout block types including headers, footers, tables, equations, code blocks, and figures
-- **Math Support**: Preserves mathematical equations with KaTeX-compatible LaTeX syntax
-- **Table Preservation**: Maintains table structure with proper colspan and rowspan handling
-- **Image Extraction**: Automatically extracts and saves figures and images with bounding box detection
-- **Multi-format Output**: Generates both Markdown and HTML outputs
-- **Configurable Processing**: Support for page range selection and custom DPI settings
-- **High-Quality Rendering**: Automatic upscaling for optimal OCR quality
+- **Paper-oriented conversion**: text, section structure, KaTeX-compatible math (`$...$`, `$$...$$`),
+  tables with colspan/rowspan, and figure crops with alt text
+- **Vector-figure recovery**: caption-driven detection and PDF-level cropping of figures Chandra
+  missed, including two-column layouts and figures glued to equation lines
+- **Agent-ready**: an MCP server exposing every step as a tool, a `hybrid_parse` prompt, and a
+  portable `SKILL.md` for Claude Code, Codex CLI, Gemini CLI, Hermes and other agents
+- **Configurable endpoint**: point at any vLLM instance via flag, environment variable or runtime tool
+- **Standalone use**: a plain Python CLI (`chandra_client.py`) for batch conversion without an agent
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - [Chandra model](https://github.com/datalab-to/chandra) running via vLLM server
 - Required Python packages (see Installation)
 
@@ -50,7 +73,7 @@ Follow the instructions at the [Chandra repository](https://github.com/datalab-t
 2. Install vLLM server
 3. Start the vLLM server with Chandra model
 
-The client expects the server to be running at `http://localhost:8001/v1` by default. One can map a remote port using ssh tunneling. 
+The client expects the server to be running at `http://localhost:8001/v1` by default. One can map a remote port using ssh tunneling (for example `ssh -L 8000:localhost:8000 gpu-host`, then pass `--server-url http://localhost:8000/v1`).
 
 ## Configuration
 
@@ -122,6 +145,219 @@ images = load_file("document.pdf", config)
 
 # See main() function for complete example
 ```
+
+## MCP server and hybrid figure recovery
+
+The package ships a stdio MCP server, `chandra-mcp`, so any MCP-capable agent (Claude Code, Claude
+Desktop, Codex CLI, Gemini CLI, Hermes Agent, Cursor, ...) can drive the conversion. Beyond plain
+conversion it implements a **hybrid workflow**: Chandra sometimes labels a vector diagram or a boxed
+text panel as ordinary text, so the caption survives but no image is cropped. Deterministic tools do
+the mechanical work and the agent supplies the judgement. The server itself never calls an LLM and
+needs no API keys.
+
+| Tool | Purpose |
+|---|---|
+| `convert_pdf` | Chandra OCR to Markdown/HTML plus cropped figures, saved to disk |
+| `convert_page_to_markdown` | Single page, returned inline |
+| `extract_pdf_metadata` | Page count and size without OCR |
+| `configure_server` | Point the server at a different vLLM endpoint at runtime |
+| `detect_missing_figures` | Find captions in the Markdown with no adjacent image (`Figure 1.`, `Fig. 2:`, `FIG. 3.`) |
+| `recover_figures` | Locate each caption in the PDF, estimate the figure box from the graphics objects above it, render the crop |
+| `render_pdf_page` | Render a page (or region) to PNG so the agent can inspect the layout and choose a manual crop |
+| `inject_figures` | Insert the recovered images above their captions in the Markdown and HTML, idempotently |
+
+The workflow the agent follows is convert → detect → **decide** → recover → **inspect** → inject. It is
+described twice, for two kinds of host: the `hybrid_parse` MCP prompt (for hosts that surface MCP
+prompts as slash commands) and [`SKILL.md`](SKILL.md) at the repository root (Agent Skills format,
+loadable by Claude Code, Codex, Gemini CLI, Hermes, Cursor and others).
+
+### Pointing the server at your vLLM instance
+
+The vLLM server hosting Chandra is usually remote and reached through an SSH tunnel. Tell
+`chandra-mcp` where it is with a flag, an environment variable, or the `configure_server` tool.
+Precedence: flags > `CHANDRA_*` environment variables > default (`http://localhost:8001/v1`).
+
+```bash
+chandra-mcp --server-url http://localhost:8001/v1   # full base URL
+chandra-mcp --host localhost --port 8000            # same as --server-url http://localhost:8000/v1
+CHANDRA_SERVER_URL=http://localhost:8000/v1 chandra-mcp
+chandra-mcp --help                                  # --api-key, --timeout, --version
+```
+
+Everywhere below, the launch command is
+
+```bash
+uvx --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp --server-url http://localhost:8001/v1
+```
+
+`uvx` fetches and caches the package, so nothing needs to be cloned. For a local checkout use
+`uv --directory /path/to/chandra_pdf2md_client run chandra-mcp ...` instead.
+
+### Claude Code
+
+**Plugin (server + skill in one step):**
+
+```text
+/plugin marketplace add YHRen/chandra_pdf2md_client
+/plugin install chandra-hybrid-parse@yhren-plugins
+```
+
+The plugin starts the server with `uv`, which must be on your PATH. It reads `CHANDRA_SERVER_URL`
+from your shell environment; export it before launching `claude` if your endpoint is not the default.
+
+**MCP server only:**
+
+```bash
+claude mcp add chandra -s user -- uvx --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp --server-url http://localhost:8001/v1
+```
+
+Then install the skill (see [Installing the skill](#installing-the-skill)) or use the
+`hybrid_parse` prompt, which Claude Code exposes as `/mcp__chandra__hybrid_parse`.
+
+### Claude Desktop
+
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/YHRen/chandra_pdf2md_client", "chandra-mcp",
+               "--server-url", "http://localhost:8001/v1"]
+    }
+  }
+}
+```
+
+### Codex CLI
+
+```bash
+codex mcp add chandra -- uvx --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp --server-url http://localhost:8001/v1
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.chandra]
+command = "uvx"
+args = ["--from", "git+https://github.com/YHRen/chandra_pdf2md_client", "chandra-mcp",
+        "--server-url", "http://localhost:8001/v1"]
+```
+
+### Gemini CLI
+
+```bash
+gemini mcp add -s user chandra uvx -- --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp --server-url http://localhost:8001/v1
+```
+
+or in `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "chandra": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/YHRen/chandra_pdf2md_client", "chandra-mcp",
+               "--server-url", "http://localhost:8001/v1"],
+      "timeout": 600000
+    }
+  }
+}
+```
+
+### Hermes Agent
+
+`~/.hermes/config.yaml`, then `/reload-mcp`:
+
+```yaml
+mcp_servers:
+  chandra:
+    command: "uvx"
+    args: ["--from", "git+https://github.com/YHRen/chandra_pdf2md_client", "chandra-mcp",
+           "--server-url", "http://localhost:8001/v1"]
+    timeout: 600
+```
+
+### Cursor and other MCP clients
+
+Any client that accepts the standard `mcpServers` JSON (Cursor `.cursor/mcp.json`, Windsurf,
+Cline, Continue, ...) can use the Claude Desktop snippet above unchanged.
+
+### Installing the skill
+
+`SKILL.md` follows the open Agent Skills format (YAML frontmatter plus a Markdown playbook), so one
+file serves every host. The quickest route is the `skills` CLI, which installs into the directories
+each agent reads (`.claude/skills`, `.agents/skills` for Codex/Gemini CLI/Cursor, `.hermes/skills`, ...):
+
+```bash
+npx skills add YHRen/chandra_pdf2md_client          # pick agents interactively; add -g for global
+npx skills add YHRen/chandra_pdf2md_client -a codex -a gemini-cli -g
+```
+
+Manual install is a copy or symlink of `SKILL.md` into a directory named after the skill:
+
+| Host | Location |
+|---|---|
+| Claude Code | `~/.claude/skills/chandra-hybrid-parse/SKILL.md` |
+| Codex CLI, Gemini CLI, Cursor (shared) | `~/.agents/skills/chandra-hybrid-parse/SKILL.md` |
+| Hermes Agent | `~/.hermes/skills/chandra-hybrid-parse/SKILL.md` |
+
+Then ask the agent to parse a paper, or invoke the skill directly (`/chandra-hybrid-parse paper.pdf`
+in Claude Code).
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHANDRA_SERVER_URL` | `http://localhost:8001/v1` | vLLM base URL (flag `--server-url` or `--host/--port` wins) |
+| `CHANDRA_API_KEY` | `chandra` | API key sent to vLLM |
+| `CHANDRA_TIMEOUT` | `300` | Per-page OCR request timeout in seconds |
+| `CHANDRA_MAX_TOKENS` / `CHANDRA_TEMPERATURE` / `CHANDRA_TOP_P` | `12384` / `0.0` / `0.1` | OCR sampling parameters |
+| `CHANDRA_IMAGE_DPI` / `CHANDRA_MIN_PDF_IMAGE_DIM` / `CHANDRA_MIN_IMAGE_DIM` | `192` / `1024` / `1536` | Page rendering |
+| `CHANDRA_OUTPUT_DIR` / `CHANDRA_IMAGE_FORMAT` | `./output` / `webp` | Output defaults |
+
+### Tool reference
+
+**convert_pdf** — `file_path` (required), `output_dir` (default `./output`), `page_range` (e.g. `1,3,5-10`),
+`include_headers_footers`, `include_images`, `output_format` (`markdown` | `html` | `both`), `image_dpi`,
+`server_url`. Returns the output paths, page count and image count.
+
+**convert_page_to_markdown** — `file_path`, `page_number` (1-based), `return_format`; returns content
+inline plus base64 images.
+
+**extract_pdf_metadata** — `file_path`; returns page count, file type, size, time estimate.
+
+**configure_server** — `server_url` (required), `api_key`, `max_tokens`, `temperature`, `top_p`, `timeout`;
+verifies connectivity.
+
+**detect_missing_figures** — `markdown_path`. Returns every caption with `has_image`, `line`,
+`image_ref`; `missing` (figure ids without an image); `referenced_without_caption` (figure numbers only
+mentioned in prose).
+
+**recover_figures** — `pdf_path`, optional `markdown_path` (fills captions; when `figures` is omitted,
+recovers every missing one), `output_dir`, `dpi`, `image_format`, and `figures`: a list of
+`{figure_id, caption?, page?, crop_box?, full_width?, fallback_height_pt?, gap_tolerance_pt?}`. Boxes are
+`[left, bottom, right, top]` in PDF points, origin bottom-left. Returns per figure the page, caption
+box, crop box, `method` (`graphics` | `fallback` | `manual`), image path and size.
+
+**render_pdf_page** — `pdf_path`, `page`, `output_path`, `dpi`, optional `crop_box`; returns the PNG path
+and `page_size_pt`.
+
+**inject_figures** — `markdown_path`, optional `html_path` (defaults to the sibling `.html`), `figures`:
+`[{figure_id, image_path}]`. Returns per-figure status `injected` | `already_has_image` | `caption_not_found`.
+
+### Troubleshooting the MCP server
+
+- **Server not found / connection closed:** make sure `uv`/`uvx` is on the PATH of the host application,
+  then run the launch command by hand in a terminal; `chandra-mcp --version` should print and the server
+  should wait on stdin.
+- **`APIConnectionError` from `convert_pdf`:** the vLLM endpoint is unreachable. Check
+  `curl http://localhost:8001/v1/models` (adjust the port); if you use an SSH tunnel, it has probably
+  dropped.
+- **Wrong crop from `recover_figures`:** call `render_pdf_page` for that page, then re-run
+  `recover_figures` with `page` and a manual `crop_box`.
 
 ## Output Structure
 
@@ -251,6 +487,9 @@ Modify `OCR_LAYOUT_PROMPT` in `chandra_client.py` to adjust the OCR behavior and
 - Check bounding box detection is working correctly
 - Verify output/images directory exists and is writable
 - Ensure the Chandra model is outputting proper data-bbox attributes
+- If a caption is present but its figure is not (typical for vector diagrams and boxed text panels),
+  use the hybrid workflow: `detect_missing_figures` → `recover_figures` → `inject_figures` via the
+  MCP server, or ask an agent with the `chandra-hybrid-parse` skill to do it
 
 ### Model Errors
 - Check vLLM server logs for detailed error messages
@@ -302,253 +541,6 @@ if __name__ == "__main__":
 
 This code is Apache 2.0
 
-
-## MCP Server
-
-This project also includes an **MCP (Model Context Protocol) server** that exposes Chandra's PDF conversion capabilities through a standardized interface. The MCP server can be used with Claude Desktop or any other MCP-compatible client.
-
-### What is MCP?
-
-MCP is a protocol that allows AI assistants like Claude to interact with external tools and services. The Chandra MCP server exposes four tools:
-
-1. **`convert_pdf`** - Convert entire PDFs to Markdown/HTML
-2. **`convert_page_to_markdown`** - Convert a single page (returns content inline)
-3. **`extract_pdf_metadata`** - Get PDF metadata without OCR
-4. **`configure_server`** - Configure Chandra server connection
-
-### Installation
-
-```bash
-# Install dependencies including MCP SDK
-uv sync
-```
-
-### Configuration
-
-#### Option 1: Install from GitHub with uvx (Recommended)
-
-Create a `.mcp.json` file in your project directory:
-
-```json
-{
-  "mcpServers": {
-    "chandra": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/YHRen/chandra_pdf2md_client",
-        "chandra-mcp"
-      ],
-      "env": {
-        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
-        "CHANDRA_API_KEY": "chandra"
-      }
-    }
-  }
-}
-```
-
-**Or** add to your user config at `~/.claude.json`:
-
-```json
-{
-  "mcpServers": {
-    "chandra": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/YHRen/chandra_pdf2md_client",
-        "chandra-mcp"
-      ],
-      "env": {
-        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
-        "CHANDRA_API_KEY": "chandra"
-      }
-    }
-  }
-}
-```
-
-This will automatically download and run the MCP server from GitHub without cloning the repository.
-
-#### Option 2: Local Development
-
-If you have the repository cloned locally, create a `.mcp.json` file:
-
-```json
-{
-  "mcpServers": {
-    "chandra": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "/path/to/chandra_pdf2md_client",
-        "chandra-mcp"
-      ],
-      "env": {
-        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
-        "CHANDRA_API_KEY": "chandra"
-      }
-    }
-  }
-}
-```
-
-Replace `/path/to/chandra_pdf2md_client` with the actual path to this repository.
-
-#### Option 3: Claude Desktop App
-
-Add this to your Claude Desktop configuration file:
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "chandra": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/YHRen/chandra_pdf2md_client",
-        "chandra-mcp"
-      ],
-      "env": {
-        "CHANDRA_SERVER_URL": "http://localhost:8001/v1",
-        "CHANDRA_API_KEY": "chandra"
-      }
-    }
-  }
-}
-```
-
-### Environment Variables
-
-Configure the MCP server using environment variables:
-
-```bash
-# Server configuration
-export CHANDRA_SERVER_URL="http://localhost:8001/v1"
-export CHANDRA_API_KEY="chandra"
-export CHANDRA_MAX_TOKENS="12384"
-export CHANDRA_TEMPERATURE="0.0"
-export CHANDRA_TOP_P="0.1"
-
-# Output configuration
-export CHANDRA_OUTPUT_DIR="./output"
-export CHANDRA_IMAGE_FORMAT="webp"
-
-# Image processing
-export CHANDRA_IMAGE_DPI="192"
-export CHANDRA_MIN_PDF_IMAGE_DIM="1024"
-export CHANDRA_MIN_IMAGE_DIM="1536"
-```
-
-### Using the MCP Server
-
-Once configured in Claude Desktop, you can use natural language to convert PDFs:
-
-```
-"Convert document.pdf to markdown and save it to ./output"
-```
-
-Claude will automatically use the appropriate MCP tool to:
-1. Connect to your Chandra server
-2. Process the PDF pages
-3. Generate Markdown/HTML output
-4. Extract images
-
-### Testing the MCP Server
-
-#### Test from GitHub
-
-```bash
-# Run directly from GitHub
-uvx --from git+https://github.com/YHRen/chandra_pdf2md_client chandra-mcp
-```
-
-#### Test locally
-
-```bash
-# Install dependencies
-uv sync
-
-# Run the server (it will listen on stdio)
-uvx --from . chandra-mcp
-```
-
-The server communicates via stdin/stdout using the MCP protocol. Press Ctrl+C to stop.
-
-### MCP Tools Reference
-
-#### convert_pdf
-
-Convert a PDF to Markdown and/or HTML.
-
-**Parameters:**
-- `file_path` (required): Path to PDF or image file
-- `output_dir` (default: "./output"): Output directory
-- `page_range` (optional): e.g., "1,3,5-10"
-- `include_headers_footers` (default: false): Include headers/footers
-- `include_images` (default: true): Include images
-- `output_format` (default: "both"): "markdown", "html", or "both"
-- `image_dpi` (default: 192): DPI for rendering
-- `server_url` (optional): Override server URL
-
-**Returns:** JSON with paths to output files, page count, and image count
-
-#### convert_page_to_markdown
-
-Convert a single page, returning content inline.
-
-**Parameters:**
-- `file_path` (required): Path to PDF or image file
-- `page_number` (default: 1): Page to convert (1-based)
-- `include_headers_footers` (default: false): Include headers/footers
-- `include_images` (default: true): Include images
-- `return_format` (default: "markdown"): "markdown", "html", or "both"
-- `server_url` (optional): Override server URL
-
-**Returns:** JSON with markdown/html content and base64-encoded images
-
-#### extract_pdf_metadata
-
-Get PDF metadata without OCR.
-
-**Parameters:**
-- `file_path` (required): Path to PDF or image file
-
-**Returns:** JSON with page count, file type, size, and estimated processing time
-
-#### configure_server
-
-Configure Chandra server connection.
-
-**Parameters:**
-- `server_url` (required): Chandra server URL
-- `api_key` (default: "chandra"): API key
-- `max_tokens` (default: 12384): Max tokens
-- `temperature` (default: 0.0): Temperature
-- `top_p` (default: 0.1): Top-p
-- `timeout` (default: 300): Timeout in seconds
-
-**Returns:** JSON with connection status
-
-### Troubleshooting MCP Server
-
-**Server not found in Claude Desktop:**
-- Check that the path in `claude_desktop_config.json` is correct
-- Verify `uv` is in your PATH
-- Restart Claude Desktop after configuration changes
-
-**Connection errors:**
-- Ensure Chandra vLLM server is running at the configured URL
-- Test with: `curl http://localhost:8001/v1/models`
-- Check environment variables are set correctly
-
-**Permission errors:**
-- Ensure output directory is writable
-- Check file paths are accessible to the MCP server process
 
 ## Standalone Client
 

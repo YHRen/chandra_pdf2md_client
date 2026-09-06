@@ -1,0 +1,15 @@
+{
+  "name": "yhren-plugins",
+  "owner": {
+    "name": "Yihui Ren",
+    "url": "https://github.com/YHRen"
+  },
+  "plugins": [
+    {
+      "name": "chandra-hybrid-parse",
+      "source": "./",
+      "description": "Chandra PDF to Markdown with agent-in-the-loop figure recovery"
+    }
+  ],
+  "description": "Plugins by Yihui Ren: Chandra PDF-to-Markdown with agent-in-the-loop figure recovery"
+}
