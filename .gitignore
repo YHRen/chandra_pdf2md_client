@@ -41,3 +41,8 @@ output/
 
 # Claude Code local files
 .claude/
+
+# uv / local outputs
+.venv/
+output_*/
+*.bak
